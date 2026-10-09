@@ -74,7 +74,7 @@ CALENDAR_INDEXES = ("FTSE 100", "FTSE 250", "S&P 500")  # which stocks the ex-di
 EMAIL_INDEXES = ["FTSE 100", "FTSE 250", "S&P 500"]   # AIM is left out of the email entirely
 # =====================================================================================
 
-MAILER_VERSION = "v18"
+MAILER_VERSION = "v19"
 RULEBOOK_VERSION = "v1.1 (9 Oct 2026)"
 RULEBOOK_URL = "https://claude.ai/artifact/WqzDqj18NJNTW7XdHgETjo"   # the pinned page (private: opens when signed in to Claude)
 RULEBOOK_CHANGED = "the two source documents (Swing Trading Recipe, QGARP spec) are now linked at the top"                 # one line on what changed, shown in the email while non-empty
@@ -1002,7 +1002,8 @@ def load_today(bq):
 
 
 def build_email(rows, macro, history, momentum, today, run_date, price_date, cal_rows=None, light=0,
-                regime=None, usd_to_gbp=None, timeline=None, mix=None, digest=None, moves_html="", picks=None):
+                regime=None, usd_to_gbp=None, timeline=None, mix=None, digest=None, moves_html="", picks=None,
+                review_html=""):
     """light (v14): 0 or 1 = full; 2 = calendar tables cut to 10 rows each. Charts are attached images, so they
     never count towards Gmail's ~100KB clipping limit and are never dropped."""
     INLINE_IMAGES.clear()
@@ -1162,6 +1163,7 @@ def build_email(rows, macro, history, momentum, today, run_date, price_date, cal
 <div style="max-width:600px; margin:0 auto; padding:0 0 20px; background:{PAPER};">
  {header}
  {stats_card}
+ {card("Daily review", review_html, sub="Checks on the system, the data and Saxo, run at 07:00 before this email.")}
  {timeline_card}
  {mix_card}
  {opp_card}
@@ -1198,6 +1200,12 @@ def send_buy_list_email(request):
         bq.query(f"CALL `{DATASET}.sp_refresh_market_regime`()").result()
     except Exception as e:  # noqa: BLE001
         print(f"Regime refresh failed (using yesterday's stored regime): {e}")
+    # v19: the daily review (checks in BigQuery; Gemini fragility read on Mondays). Fails open.
+    import daily_review as dr
+    review_err = dr.run_checks(bq, DATASET)
+    dr.fragility_read(bq, DATASET, today, model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+                      project=PROJECT_ID, location=os.environ.get("GEMINI_LOCATION", "global"))
+    review_html = dr.card_inner(dr.load(bq, DATASET, today), today, review_err)
     try:
         rows = load_today(bq)
         macro = next(iter([dict(r) for r in bq.query(
@@ -1268,7 +1276,7 @@ def send_buy_list_email(request):
 
     for light in (0, 1, 2):     # keep under Gmail's ~100KB clipping limit
         html, n_orders = build_email(rows, macro, history, momentum, today, run_date, price_date, cal_rows, light,
-                                     regime, usd_to_gbp, timeline, mix, digest, moves_html, picks)
+                                     regime, usd_to_gbp, timeline, mix, digest, moves_html, picks, review_html)
         if len(html.encode()) / 1024 < 95:
             break
         print(f"Email over 95KB at detail level {light}; building a lighter version.")
@@ -1297,6 +1305,7 @@ def send_buy_list_email(request):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
             s.login(cfg["smtp_user"], cfg["app_password"])
             s.sendmail(cfg["smtp_user"], cfg["to"], msg.as_string())
+        dr.record_send(bq, DATASET, today, subject, MAILER_VERSION)   # v19: lets tomorrow's check A4 confirm the send
         if news_keys:      # same bookkeeping the old digest did
             try:
                 bq.query(f"""UPDATE `{DATASET}.fact_alert_log` SET digest_included_at = CURRENT_TIMESTAMP()
