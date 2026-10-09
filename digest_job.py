@@ -100,13 +100,15 @@ def portfolio():
         check = (f'<p style="color:#C2261C;font-size:12px;margin:6px 0 0">Check: Saxo reports the account at '
                  f'{nc.money(saxo_total)}; the lines below add up to {nc.money(total)}. A trade from today may not be '
                  f'reflected yet.</p>')
-    def stat(label, value, color="#0A0A0A"):
-        return (f'<td style="padding:0 12px 0 0;vertical-align:top">'
-                f'<div style="color:#6B6B6B;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">{label}</div>'
+    def stat(label, value, color="#0A0A0A", top=False):
+        # v20: two figures per row (2 x 2), so the row fits a phone screen without sideways scrolling
+        pad = "0 12px 0 0" if top else "12px 12px 0 0"
+        return (f'<td style="padding:{pad};vertical-align:top;width:50%">'
+                f'<div style="color:#6B6B6B;font-size:11px;text-transform:uppercase;letter-spacing:0.08em">{label}</div>'
                 f'<div style="font-size:19px;font-weight:600;color:{color};white-space:nowrap;margin-top:4px">{value}</div></td>')
-    head = (f'<table role="presentation" style="border-collapse:collapse;width:100%"><tr>'
-            f'{stat("Total, both ISAs", nc.money(total + manual_v))}{stat("Saxo", nc.money(total))}'
-            f'{stat("Cash", nc.money(cash))}'
+    head = (f'<table role="presentation" style="border-collapse:collapse;width:100%">'
+            f'<tr>{stat("Total, both ISAs", nc.money(total + manual_v), top=True)}{stat("Saxo", nc.money(total), top=True)}</tr>'
+            f'<tr>{stat("Cash", nc.money(cash))}'
             f'{stat("Unrealised P&amp;L", nc.money(grand_p), nc.colour(grand_p))}</tr></table>'
             '<p style="color:#6B6B6B;font-size:12px;margin:6px 0 0">Saxo = positions + cash; the total adds the other '
             'accounts listed at the bottom (values entered by hand). All figures in £. '
