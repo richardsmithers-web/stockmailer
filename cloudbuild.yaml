@@ -1,0 +1,18 @@
+# Deploys the morning briefing to Cloud Run whenever a change is merged into main.
+# Same command Richard runs by hand today; Cloud Run keeps the existing settings, env vars and secrets.
+steps:
+  - id: deploy-stockmailer
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - stockmailer
+      - --source=.
+      - --region=europe-west2
+      - --function=send_buy_list_email
+      - --base-image=europe-west2-docker.pkg.dev/serverless-runtimes/google-24/runtimes/python314
+      - --quiet
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s

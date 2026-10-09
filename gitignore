@@ -1,0 +1,7 @@
+# never commit keys, local settings or backups
+*.json
+!package.json
+.env
+*.zip
+backup*/
+__pycache__/
