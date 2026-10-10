@@ -7,7 +7,9 @@ How it fits together
 - The maths lives in the BigQuery view vw_early_warning (sql/early_warning_02_view.sql). It reads:
     hist_macro_20y      FRED and ONS series fetched here, plus the Bank of England series already loaded nightly
     hist_index_20y      FTSE 100 and S&P 500 prices and volumes (already loaded nightly)
-    hist_prices_20y_us  RSP and SPY fund prices, fetched here, for the equal-weight vs market-cap comparison
+    hist_prices_20y_us  RSP and SPY fund prices, fetched here, for the equal-weight vs market-cap comparison.
+                        Also ERNS.L (v21.2): not an indicator; it prices the Barclays ISA in Power BI
+                        (view rpt_fact_isa_daily), so that card no longer depends on Saxo holding ERNS too.
     fact_daily_prices   our own stock prices (UK breadth)
 - Every morning (Tue-Sat) the stockmailer calls refresh_panel() BEFORE the email (quick: it only rebuilds ew_daily
   from data already in BigQuery), then refresh_feeds() and refresh_panel() again AFTER the email has gone (v21.1),
@@ -24,7 +26,7 @@ Where the outside data comes from (all free, no keys)
   If the Cloud Run service has a FRED_API_KEY environment variable (free key from fred.stlouisfed.org), the official
   FRED API is used; otherwise the public fredgraph.csv download.
 - ONS: UK unemployment rate, series MGSX
-- Yahoo Finance chart data: RSP and SPY daily prices
+- Yahoo Finance chart data: RSP and SPY daily prices; ERNS.L daily prices (Barclays ISA, v21.2)
 """
 import csv
 import html
@@ -49,7 +51,8 @@ FRED_API_URL = ("https://api.stlouisfed.org/fred/series/observations?series_id={
 ONS_URL = ("https://www.ons.gov.uk/employmentandlabourmarket/peoplenotinwork/unemployment/"
            "timeseries/mgsx/lms/data")
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1y&interval=1d"
-FUNDS = {"RSP": "BENCHMARK S&P 500 EQUAL WEIGHT", "SPY": "BENCHMARK S&P 500"}
+FUNDS = {"RSP": "BENCHMARK S&P 500 EQUAL WEIGHT", "SPY": "BENCHMARK S&P 500",
+         "ERNS.L": "BARCLAYS ISA HOLDING"}   # v21.2: ERNS.L prices the Barclays ISA card; not used by any light
 UA = {"User-Agent": "Mozilla/5.0 (stockmailer early-warning feed; personal use)"}
 TIMEOUT_S = 12               # per website request
 FEEDS_BUDGET_S = 50          # all feeds together, fetched in parallel
@@ -99,19 +102,21 @@ def _ons_unemployment():
 
 
 def _yahoo_fund(sym):
-    """Daily closes for a US fund. The last bar is dropped if it is today (US time), as it may be unfinished."""
+    """Daily closes for a fund. The last bar is dropped if it is today (exchange time), as it may be unfinished.
+    London prices quoted in pence (currency 'GBp') are turned into pounds."""
     res = json.loads(_get(YAHOO_URL.format(sym=sym)))["chart"]["result"][0]
     offset = res["meta"].get("gmtoffset", 0)
+    scale = 0.01 if res["meta"].get("currency") == "GBp" else 1.0
     q = res["indicators"]["quote"][0]
     adj = (res["indicators"].get("adjclose") or [{}])[0].get("adjclose") or q["close"]
-    today_us = (datetime.now(timezone.utc) + timedelta(seconds=offset)).date()
+    today_ex = (datetime.now(timezone.utc) + timedelta(seconds=offset)).date()
     rows = []
     for ts, c, a, v in zip(res["timestamp"], q["close"], adj, q["volume"]):
         d = datetime.fromtimestamp(ts + offset, tz=timezone.utc).date()
-        if c is None or d >= today_us:
+        if c is None or d >= today_ex:
             continue
         rows.append({"ticker": sym, "symbol": sym, "index_name": FUNDS[sym], "price_date": d.isoformat(),
-                     "close": float(c), "adj_close": float(a) if a is not None else float(c),
+                     "close": float(c) * scale, "adj_close": (float(a) if a is not None else float(c)) * scale,
                      "volume": float(v or 0), "source": "yahoo"})
     return rows
 
