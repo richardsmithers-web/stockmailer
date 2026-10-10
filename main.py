@@ -81,7 +81,7 @@ CALENDAR_INDEXES = ("FTSE 100", "FTSE 250", "S&P 500")  # which stocks the ex-di
 EMAIL_INDEXES = ["FTSE 100", "FTSE 250", "S&P 500"]   # AIM is left out of the email entirely
 # =====================================================================================
 
-MAILER_VERSION = "v21.1"
+MAILER_VERSION = "v21.2"
 RULEBOOK_VERSION = "v1.1 (9 Oct 2026)"
 RULEBOOK_URL = "https://claude.ai/artifact/WqzDqj18NJNTW7XdHgETjo"   # the pinned page (private: opens when signed in to Claude)
 RULEBOOK_CHANGED = "the two source documents (Swing Trading Recipe, QGARP spec) are now linked at the top"                 # one line on what changed, shown in the email while non-empty
