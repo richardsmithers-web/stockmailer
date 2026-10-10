@@ -9,16 +9,20 @@ How it fits together
     hist_index_20y      FTSE 100 and S&P 500 prices and volumes (already loaded nightly)
     hist_prices_20y_us  RSP and SPY fund prices, fetched here, for the equal-weight vs market-cap comparison
     fact_daily_prices   our own stock prices (UK breadth)
-- Every morning (Tue-Sat) the stockmailer calls refresh_feeds() then refresh_panel(). refresh_panel() runs
-  sp_refresh_early_warning(), which snapshots the view into ew_daily. Power BI reads ew_daily through the
-  rpt_*early_warning* views, so the dashboard is up to date every morning.
+- Every morning (Tue-Sat) the stockmailer calls refresh_panel() BEFORE the email (quick: it only rebuilds ew_daily
+  from data already in BigQuery), then refresh_feeds() and refresh_panel() again AFTER the email has gone (v21.1),
+  so a slow or broken website can never delay or stop the email. refresh_panel() runs sp_refresh_early_warning(),
+  which snapshots the view into ew_daily. Power BI reads ew_daily through the rpt_*early_warning* views.
+- Feeds are fetched in parallel with a short timeout and an overall time limit. Every feed's result (rows or the
+  error text) is written to BigQuery table ew_feed_log, so failures can be read without Cloud Run logs.
 - Only the Saturday email shows the card (show_card_today). It compares the latest reading with a week earlier.
 - Everything here fails open: if a website doesn't answer, the rest still runs, the panel uses the last
   figures it has, and the card says which feed failed.
 
 Where the outside data comes from (all free, no keys)
-- FRED (Federal Reserve Bank of St. Louis), fredgraph.csv download: T10Y3M, BAMLH0A0HYM2, SAHMREALTIME, ICSA,
-  VIXCLS, NCBEILQ027S, GDP
+- FRED (Federal Reserve Bank of St. Louis): T10Y3M, BAMLH0A0HYM2, SAHMREALTIME, ICSA, VIXCLS, NCBEILQ027S, GDP.
+  If the Cloud Run service has a FRED_API_KEY environment variable (free key from fred.stlouisfed.org), the official
+  FRED API is used; otherwise the public fredgraph.csv download.
 - ONS: UK unemployment rate, series MGSX
 - Yahoo Finance chart data: RSP and SPY daily prices
 """
@@ -26,7 +30,10 @@ import csv
 import html
 import io
 import json
+import os
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 
 from google.cloud import bigquery
@@ -37,12 +44,15 @@ GOOD, BAD, AMBER = "#0A7A3E", "#C2261C", "#A35C00"
 
 FRED_SERIES = ["T10Y3M", "BAMLH0A0HYM2", "SAHMREALTIME", "ICSA", "VIXCLS", "NCBEILQ027S", "GDP"]
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd=2004-01-01"
+FRED_API_URL = ("https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={key}"
+                "&file_type=json&observation_start=2004-01-01")
 ONS_URL = ("https://www.ons.gov.uk/employmentandlabourmarket/peoplenotinwork/unemployment/"
            "timeseries/mgsx/lms/data")
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1y&interval=1d"
 FUNDS = {"RSP": "BENCHMARK S&P 500 EQUAL WEIGHT", "SPY": "BENCHMARK S&P 500"}
 UA = {"User-Agent": "Mozilla/5.0 (stockmailer early-warning feed; personal use)"}
-TIMEOUT_S = 25
+TIMEOUT_S = 12               # per website request
+FEEDS_BUDGET_S = 50          # all feeds together, fetched in parallel
 
 SHOW_ON_WEEKDAY = 5          # Saturday (Monday = 0)
 LIGHT_RANK = {"RED": 0, "AMBER": 1, "GREEN": 2, "NO DATA": 3}
@@ -57,7 +67,12 @@ def _get(url):
 
 
 def _fred(sid):
-    """Rows (series, obs_date, value) from a FRED CSV. FRED marks missing days with '.'."""
+    """Rows (series, obs_date, value) from FRED. FRED marks missing days with '.'."""
+    key = os.environ.get("FRED_API_KEY", "").strip()
+    if key:
+        obs = json.loads(_get(FRED_API_URL.format(sid=sid, key=key))).get("observations", [])
+        return [{"series": sid, "obs_date": o["date"][:10], "value": float(o["value"]), "source": "fred"}
+                for o in obs if o.get("value") not in (None, "", ".")]
     text = _get(FRED_URL.format(sid=sid))
     reader = csv.reader(io.StringIO(text))
     next(reader)                                  # header: observation_date,<SID>
@@ -108,20 +123,48 @@ def _load_and_merge(bq, dataset, rows, stg, schema, merge_sql):
     bq.query(merge_sql).result(timeout=120)
 
 
-def refresh_feeds(bq, dataset):
-    """Fetch every outside series and merge it into BigQuery. Returns a list of feeds that failed (empty = all OK)."""
-    failed, macro = [], []
-    for sid in FRED_SERIES:
-        try:
-            macro += _fred(sid)
-        except Exception as e:  # noqa: BLE001
-            print(f"Early warning: FRED {sid} failed: {e}")
-            failed.append(f"FRED {sid}")
+def _log(bq, dataset, run_at, results):
+    """One row per feed in ew_feed_log. Never raises."""
     try:
-        macro += _ons_unemployment()
+        rows = [{"run_at": run_at, "feed": f, "ok": r["ok"], "n_rows": r["n"], "seconds": round(r["s"], 1),
+                 "error": (r["err"] or None)} for f, r in results.items()]
+        bq.load_table_from_json(rows, f"{dataset}.ew_feed_log", job_config=bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND")).result(timeout=60)
     except Exception as e:  # noqa: BLE001
-        print(f"Early warning: ONS unemployment failed: {e}")
-        failed.append("ONS unemployment")
+        print(f"Early warning: could not write ew_feed_log: {e}")
+
+
+def _timed(fn, *args):
+    t0 = time.time()
+    try:
+        rows = fn(*args)
+        return {"ok": True, "rows": rows, "n": len(rows), "s": time.time() - t0, "err": ""}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "rows": [], "n": 0, "s": time.time() - t0, "err": f"{type(e).__name__}: {e}"[:300]}
+
+
+def refresh_feeds(bq, dataset):
+    """Fetch every outside series (in parallel, within FEEDS_BUDGET_S) and merge it into BigQuery.
+    Returns a list of feeds that failed (empty = all OK). Every result is logged to ew_feed_log."""
+    run_at = datetime.now(timezone.utc).isoformat()
+    jobs = {f"FRED {sid}": (_fred, sid) for sid in FRED_SERIES}
+    jobs["ONS unemployment"] = (_ons_unemployment,)
+    for sym in FUNDS:
+        jobs[f"{sym} fund prices"] = (_yahoo_fund, sym)
+    results = {}
+    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    futs = {pool.submit(_timed, *job): name for name, job in jobs.items()}
+    done, not_done = wait(futs, timeout=FEEDS_BUDGET_S)
+    for fut, name in futs.items():
+        results[name] = fut.result() if fut in done else {"ok": False, "rows": [], "n": 0, "s": FEEDS_BUDGET_S,
+                                                        "err": f"no answer within {FEEDS_BUDGET_S}s"}
+    pool.shutdown(wait=False, cancel_futures=True)
+    for name, r in results.items():
+        if not r["ok"]:
+            print(f"Early warning: {name} failed: {r['err']}")
+
+    macro = [row for n, r in results.items() if n.startswith(("FRED", "ONS")) for row in r["rows"]]
+    funds = [row for n, r in results.items() if n.endswith("fund prices") for row in r["rows"]]
     if macro:
         try:
             _load_and_merge(
@@ -138,14 +181,7 @@ def refresh_feeds(bq, dataset):
             print(f"Early warning: merged {len(macro)} FRED/ONS rows.")
         except Exception as e:  # noqa: BLE001
             print(f"Early warning: saving FRED/ONS rows failed: {e}")
-            failed.append("saving FRED/ONS data")
-    funds = []
-    for sym in FUNDS:
-        try:
-            funds += _yahoo_fund(sym)
-        except Exception as e:  # noqa: BLE001
-            print(f"Early warning: Yahoo {sym} failed: {e}")
-            failed.append(f"{sym} fund prices")
+            results["saving FRED/ONS data"] = {"ok": False, "n": 0, "s": 0, "err": str(e)[:300]}
     if funds:
         try:
             _load_and_merge(
@@ -165,8 +201,21 @@ def refresh_feeds(bq, dataset):
             print(f"Early warning: merged {len(funds)} fund price rows.")
         except Exception as e:  # noqa: BLE001
             print(f"Early warning: saving fund prices failed: {e}")
-            failed.append("saving fund prices")
-    return failed
+            results["saving fund prices"] = {"ok": False, "n": 0, "s": 0, "err": str(e)[:300]}
+    _log(bq, dataset, run_at, results)
+    return [name for name, r in results.items() if not r["ok"]]
+
+
+def last_failures(bq, dataset):
+    """Feeds that failed on the most recent run (read from ew_feed_log), for the card. Never raises."""
+    try:
+        return [r["feed"] for r in bq.query(f"""
+            SELECT feed FROM `{dataset}.ew_feed_log`
+            WHERE run_at = (SELECT MAX(run_at) FROM `{dataset}.ew_feed_log`) AND NOT ok
+            ORDER BY feed""").result()]
+    except Exception as e:  # noqa: BLE001
+        print(f"Early warning: could not read ew_feed_log: {e}")
+        return []
 
 
 def refresh_panel(bq, dataset, timeout_s=240):
@@ -299,7 +348,7 @@ def card_inner(rows, feed_failures=None, refresh_error=None):
         notes.append(f"{n_nod} indicator{'s' if n_nod != 1 else ''} had no data: "
                      + ", ".join(_esc(r["name"]) for r in rows if r["light"] == "NO DATA"))
     if feed_failures:
-        notes.append("These feeds didn't answer this morning, so last week's figures were used: "
+        notes.append("These feeds didn't answer on the last run, so the latest figures they gave are used: "
                      + ", ".join(_esc(f) for f in feed_failures))
     if refresh_error:
         notes.append("The panel wasn't rebuilt this morning, so these are yesterday's readings")
