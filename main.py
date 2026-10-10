@@ -15,6 +15,10 @@ ONE email whose top section says exactly what, if anything, to enter at Saxo tom
 
 Credentials come from the `mail-config` secret (Secret Manager), never from this file.
 
+v21 (10 Oct 2026): "Early warning" card in the Saturday email (early_warning.py): 12 market-stress indicators
+(yield curves, junk-bond spread, US and UK jobs, VIX, Buffett indicator, breadth, distribution days) with
+traffic lights from BigQuery table ew_indicators, and what changed since last week. Every run also fetches
+FRED, ONS and RSP/SPY data and rebuilds ew_daily so the Power BI page is current daily. For judgement only.
 v18 (9 Oct 2026): "Pure mono" restyle -- one typeface, black/white/grey with colour only for gains and losses,
 every section a white card on a grey ground; regime shown as a "ladder" (UK regime step line, FTSE 100 panel below,
 chosen 9 Oct) with a summary underneath (now, days in regime, daily reading, US regime, time in each); the mix drawn as email-safe table bars instead of an image.
@@ -74,7 +78,7 @@ CALENDAR_INDEXES = ("FTSE 100", "FTSE 250", "S&P 500")  # which stocks the ex-di
 EMAIL_INDEXES = ["FTSE 100", "FTSE 250", "S&P 500"]   # AIM is left out of the email entirely
 # =====================================================================================
 
-MAILER_VERSION = "v20"
+MAILER_VERSION = "v21"
 RULEBOOK_VERSION = "v1.1 (9 Oct 2026)"
 RULEBOOK_URL = "https://claude.ai/artifact/WqzDqj18NJNTW7XdHgETjo"   # the pinned page (private: opens when signed in to Claude)
 RULEBOOK_CHANGED = "the two source documents (Swing Trading Recipe, QGARP spec) are now linked at the top"                 # one line on what changed, shown in the email while non-empty
@@ -1003,7 +1007,7 @@ def load_today(bq):
 
 def build_email(rows, macro, history, momentum, today, run_date, price_date, cal_rows=None, light=0,
                 regime=None, usd_to_gbp=None, timeline=None, mix=None, digest=None, moves_html="", picks=None,
-                review_html=""):
+                review_html="", ew_html=""):
     """light (v14): 0 or 1 = full; 2 = calendar tables cut to 10 rows each. Charts are attached images, so they
     never count towards Gmail's ~100KB clipping limit and are never dropped."""
     INLINE_IMAGES.clear()
@@ -1164,6 +1168,7 @@ def build_email(rows, macro, history, momentum, today, run_date, price_date, cal
  {header}
  {stats_card}
  {card("Daily review", review_html, sub="Checks on the system, the data and Saxo, run at 07:00 before this email.")}
+ {card("Early warning", ew_html, sub="Saturdays: 12 market-stress indicators, now and against last week. For judgement only.") if ew_html else ""}
  {timeline_card}
  {mix_card}
  {opp_card}
@@ -1206,6 +1211,15 @@ def send_buy_list_email(request):
     dr.fragility_read(bq, DATASET, today, model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
                       project=PROJECT_ID, location=os.environ.get("GEMINI_LOCATION", "global"))
     review_html = dr.card_inner(dr.load(bq, DATASET, today), today, review_err)
+    # v21: early warning panel. Feeds and the BigQuery snapshot refresh every run (for Power BI);
+    # the card only goes in the Saturday email. Fails open.
+    import early_warning as ew
+    ew_failed = ew.refresh_feeds(bq, DATASET)
+    ew_err = ew.refresh_panel(bq, DATASET)
+    ew_html = ""
+    if ew.show_card_today(today):
+        ew_rows, _ = ew.load_week(bq, DATASET)
+        ew_html = ew.card_inner(ew_rows, ew_failed, ew_err)
     try:
         rows = load_today(bq)
         macro = next(iter([dict(r) for r in bq.query(
@@ -1276,7 +1290,7 @@ def send_buy_list_email(request):
 
     for light in (0, 1, 2):     # keep under Gmail's ~100KB clipping limit
         html, n_orders = build_email(rows, macro, history, momentum, today, run_date, price_date, cal_rows, light,
-                                     regime, usd_to_gbp, timeline, mix, digest, moves_html, picks, review_html)
+                                     regime, usd_to_gbp, timeline, mix, digest, moves_html, picks, review_html, ew_html)
         if len(html.encode()) / 1024 < 95:
             break
         print(f"Email over 95KB at detail level {light}; building a lighter version.")
