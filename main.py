@@ -15,6 +15,9 @@ ONE email whose top section says exactly what, if anything, to enter at Saxo tom
 
 Credentials come from the `mail-config` secret (Secret Manager), never from this file.
 
+v21.1 (10 Oct 2026): the early warning website feeds run AFTER the email is sent, in parallel within 50 seconds,
+and log every result to BigQuery table ew_feed_log (v21 ran them first, one by one, and 7 slow FRED failures made
+the run take nearly 5 minutes). Optional FRED_API_KEY environment variable uses the official FRED API.
 v21 (10 Oct 2026): "Early warning" card in the Saturday email (early_warning.py): 12 market-stress indicators
 (yield curves, junk-bond spread, US and UK jobs, VIX, Buffett indicator, breadth, distribution days) with
 traffic lights from BigQuery table ew_indicators, and what changed since last week. Every run also fetches
@@ -78,7 +81,7 @@ CALENDAR_INDEXES = ("FTSE 100", "FTSE 250", "S&P 500")  # which stocks the ex-di
 EMAIL_INDEXES = ["FTSE 100", "FTSE 250", "S&P 500"]   # AIM is left out of the email entirely
 # =====================================================================================
 
-MAILER_VERSION = "v21"
+MAILER_VERSION = "v21.1"
 RULEBOOK_VERSION = "v1.1 (9 Oct 2026)"
 RULEBOOK_URL = "https://claude.ai/artifact/WqzDqj18NJNTW7XdHgETjo"   # the pinned page (private: opens when signed in to Claude)
 RULEBOOK_CHANGED = "the two source documents (Swing Trading Recipe, QGARP spec) are now linked at the top"                 # one line on what changed, shown in the email while non-empty
@@ -1211,15 +1214,14 @@ def send_buy_list_email(request):
     dr.fragility_read(bq, DATASET, today, model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
                       project=PROJECT_ID, location=os.environ.get("GEMINI_LOCATION", "global"))
     review_html = dr.card_inner(dr.load(bq, DATASET, today), today, review_err)
-    # v21: early warning panel. Feeds and the BigQuery snapshot refresh every run (for Power BI);
-    # the card only goes in the Saturday email. Fails open.
+    # v21: early warning panel; the card only goes in the Saturday email. Fails open.
+    # v21.1: only the quick BigQuery rebuild runs before the email; the website feeds run after it is sent.
     import early_warning as ew
-    ew_failed = ew.refresh_feeds(bq, DATASET)
     ew_err = ew.refresh_panel(bq, DATASET)
     ew_html = ""
     if ew.show_card_today(today):
         ew_rows, _ = ew.load_week(bq, DATASET)
-        ew_html = ew.card_inner(ew_rows, ew_failed, ew_err)
+        ew_html = ew.card_inner(ew_rows, ew.last_failures(bq, DATASET), ew_err)
     try:
         rows = load_today(bq)
         macro = next(iter([dict(r) for r in bq.query(
@@ -1320,6 +1322,11 @@ def send_buy_list_email(request):
             s.login(cfg["smtp_user"], cfg["app_password"])
             s.sendmail(cfg["smtp_user"], cfg["to"], msg.as_string())
         dr.record_send(bq, DATASET, today, subject, MAILER_VERSION)   # v19: lets tomorrow's check A4 confirm the send
+        try:   # v21.1: the early warning feeds run after the email has gone, so they can never delay it
+            ew.refresh_feeds(bq, DATASET)
+            ew.refresh_panel(bq, DATASET)
+        except Exception as e:  # noqa: BLE001
+            print(f"Early warning feeds after send failed: {e}")
         if news_keys:      # same bookkeeping the old digest did
             try:
                 bq.query(f"""UPDATE `{DATASET}.fact_alert_log` SET digest_included_at = CURRENT_TIMESTAMP()
