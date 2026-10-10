@@ -94,3 +94,12 @@ SELECT * FROM UNNEST([
     'As above, for the US market.',
     'Own index data (hist_index_20y)')
 ]);
+
+-- Added 10 Oct 2026 (suite v3.4): each indicator's weight in the 1-10 risk score.
+-- Leading signals count 1.5x, valuation 0.5x (it is never red), everything else 1x.
+ALTER TABLE `project-e042f011-a587-4cbe-8f7.Market_Data_Project.ew_indicators`
+  ADD COLUMN IF NOT EXISTS score_weight FLOAT64
+  OPTIONS (description = 'Weight in the 1-10 risk score: 1.5 for leading signals (yield curves, junk spread, jobless claims), 0.5 for valuation, 1.0 otherwise.');
+UPDATE `project-e042f011-a587-4cbe-8f7.Market_Data_Project.ew_indicators`
+SET score_weight = CASE WHEN indicator_id IN ('R1', 'R2', 'C1', 'J3') THEN 1.5 WHEN indicator_id = 'V1' THEN 0.5 ELSE 1.0 END
+WHERE TRUE;
