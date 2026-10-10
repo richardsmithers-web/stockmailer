@@ -244,11 +244,14 @@ def load_week(bq, dataset):
                  prev AS (SELECT MAX(warning_date) AS d FROM `{dataset}.ew_daily`, latest
                           WHERE warning_date <= DATE_SUB(latest.d, INTERVAL 7 DAY))
             SELECT n.indicator_id, n.sort, n.area, n.name, n.unit, n.value, n.light, n.detail, n.data_as_of,
-                   n.pctile_20y, n.warning_date, p.value AS prev_value, p.light AS prev_light
+                   n.pctile_20y, n.warning_date, p.value AS prev_value, p.light AS prev_light,
+                   sn.risk_score, sp.risk_score AS prev_risk_score
             FROM `{dataset}.ew_daily` n
             JOIN latest ON n.warning_date = latest.d
             CROSS JOIN prev
             LEFT JOIN `{dataset}.ew_daily` p ON p.indicator_id = n.indicator_id AND p.warning_date = prev.d
+            LEFT JOIN `{dataset}.rpt_fact_early_warning_daily` sn ON sn.warning_date = latest.d
+            LEFT JOIN `{dataset}.rpt_fact_early_warning_daily` sp ON sp.warning_date = prev.d
             ORDER BY n.sort""").result()]
     except Exception as e:  # noqa: BLE001
         print(f"Early warning read failed: {e}")
@@ -308,6 +311,21 @@ def card_inner(rows, feed_failures=None, refresh_error=None):
         headline = f'<b style="color:{GOOD};">All {n_live} indicators green</b>'
     head = f'<div style="font-size:14px; color:{INK}; margin-bottom:4px;">{headline}</div>'
 
+    # the 1-10 risk score (same rule as Power BI page D3: amber 1 point, red 3, weighted; 10 = half the possible points)
+    score, prev_score = rows[0].get("risk_score"), rows[0].get("prev_risk_score")
+    if score is not None:
+        score = float(score)
+        band = "High" if score >= 7 else "Elevated" if score >= 5 else "Watch" if score >= 3 else "Calm"
+        scol = BAD if score >= 7 else AMBER if score >= 3 else GOOD
+        if prev_score is None:
+            move = ""
+        else:
+            diff = score - float(prev_score)
+            move = (" &middot; unchanged on last week" if abs(diff) < 0.05 else
+                    f' &middot; {"up" if diff > 0 else "down"} {abs(diff):.1f} on last week')
+        head += (f'<div style="font-size:13px; color:{INK}; margin-bottom:4px;">Risk score '
+                 f'<b style="color:{scol};">{score:.1f} / 10 ({band})</b><span style="color:{SOFT};">{move}</span></div>')
+
     # what changed colour since last week
     moved = [r for r in rows if r.get("prev_light") and r["prev_light"] != r["light"]]
     if moved:
@@ -355,6 +373,7 @@ def card_inner(rows, feed_failures=None, refresh_error=None):
     note_html = "".join(f'<div style="font-size:12px; color:{AMBER}; margin-top:6px;">{n}.</div>' for n in notes)
 
     foot = (f'<div style="font-size:11px; color:{FAINT}; margin-top:10px; line-height:1.5;">For judgement only: nothing '
-            f'here changes the regime, the mix or any order. Rules and thresholds live in BigQuery table '
-            f'ew_indicators; the daily history is on the Early warning page in Power BI.</div>')
+            f'here changes the regime, the mix or any order. Risk score: amber 1 point, red 3, weighted 1.5 for the '
+            f'leading signals; 10 means half the possible points. Rules, thresholds and weights live in BigQuery table '
+            f'ew_indicators; the daily history is on page D3 Early warning in Power BI.</div>')
     return head + table + (f'<div style="margin-top:10px;">{det}</div>' if det else "") + note_html + foot
